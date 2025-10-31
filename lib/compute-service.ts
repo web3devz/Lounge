@@ -2,6 +2,13 @@ import { ComputeClient, ComputeConfig, JobSpec, GetJobResponse, ListJobsResponse
 import { ethers } from 'ethers';
 import { nanoid } from 'nanoid';
 
+// Mainnet configuration
+const MAINNET_CONFIG: ComputeConfig = {
+  rpcUrl: 'https://mainnet.infura.io/v3/YOUR_INFURA_KEY', // Replace with your Infura key
+  computeContractAddress: '0x1234...', // Replace with actual mainnet contract
+  privateKey: process.env.COMPUTE_PRIVATE_KEY || '',
+};
+
 /**
  * Resource configuration for compute jobs
  */
@@ -78,7 +85,26 @@ export interface JobMetadata {
   projectId?: string;
   // Cost tracking tags
   costCenter?: string;
+  // Environment (mainnet/testnet)
+  environment?: string;
 }
+
+// Production environment defaults
+const PRODUCTION_DEFAULTS = {
+  resources: {
+    cpu: "1",
+    memory: "2Gi",
+    storage: "5Gi",
+    preemptible: false
+  },
+  retryPolicy: {
+    maxRetries: 2,
+    initialDelaySeconds: 10
+  },
+  network: {
+    internet: true
+  }
+} as const;
 
 /**
  * Configuration for compute jobs. This extends the base job spec
@@ -115,12 +141,9 @@ export interface ComputeJobConfig extends JobSpec {
   // Maximum runtime in seconds
   timeoutSeconds?: number;
   // Retry policy
-  retry?: {
-    limit: number;
-    // Minimum wait between retries
-    minBackoff?: string;
-    // Maximum wait between retries
-    maxBackoff?: string;
+  retryPolicy?: {
+    maxRetries: number;
+    initialDelaySeconds: number;
   };
   // Dependencies on other jobs
   dependencies?: Array<{
@@ -137,17 +160,27 @@ export interface ComputeJobConfig extends JobSpec {
  * This provides a high-level interface for running containerized
  * workloads on 0g's compute network.
  */
-export class ComputeService {
-  private client: ComputeClient;
-  private activeJobs: Map<string, { stopLogs?: () => void }> = new Map();
+class ComputeService {
+  private readonly client: ComputeClient;
+  private readonly activeJobs: Map<string, { stopLogs?: () => void }> = new Map();
+  private readonly environment: 'mainnet' | 'testnet';
 
-  constructor(config?: {
+
+  public constructor(config?: {
     apiKey?: string;
     baseUrl?: string;
     provider?: ethers.Provider;
     signer?: ethers.Signer;
+    environment?: 'mainnet' | 'testnet';
   }) {
-    const cfg: ComputeConfig = {
+    this.environment = config?.environment ?? process.env.COMPUTE_ENVIRONMENT as 'mainnet' | 'testnet' ?? 'testnet';
+    
+    const cfg: ComputeConfig = this.environment === 'mainnet' ? {
+      ...MAINNET_CONFIG,
+      apiKey: config?.apiKey ?? process.env.OG_API_KEY,
+      provider: config?.provider,
+      signer: config?.signer,
+    } : {
       apiKey: config?.apiKey ?? process.env.OG_API_KEY,
       baseUrl: config?.baseUrl ?? process.env.OG_BASE_URL ?? "https://api.0g.ai",
       provider: config?.provider,
@@ -160,9 +193,53 @@ export class ComputeService {
    * Submit a new compute job with the given configuration.
    * Returns the job ID and initial status.
    */
-  async submitJob(config: ComputeJobConfig): Promise<{ jobId: string; status: Status }> {
+  /**
+   * Validates if configuration meets mainnet deployment requirements
+   */
+  private validateMainnetConfig(config: ComputeJobConfig) {
+    if (!config.resources?.cpu || !config.resources?.memory) {
+      throw new Error('Mainnet jobs require explicit CPU and memory configuration');
+    }
+    if (!config.timeoutSeconds) {
+      throw new Error('Mainnet jobs require explicit timeout configuration');
+    }
+    if (!config.retryPolicy) {
+      throw new Error('Mainnet jobs require retry policy configuration');
+    }
+  }
+
+  /**
+   * Submit a new compute job with the given configuration.
+   * Returns the job ID and initial status.
+   */
+  public async submitJob(config: ComputeJobConfig): Promise<{ jobId: string; status: Status }> {
     // Generate a unique job ID
     const jobId = nanoid();
+
+    // Apply production defaults and validate for mainnet
+    if (this.environment === 'mainnet') {
+      config = {
+        ...config,
+        resources: {
+          ...PRODUCTION_DEFAULTS.resources,
+          ...config.resources
+        },
+        retryPolicy: {
+          ...PRODUCTION_DEFAULTS.retryPolicy,
+          ...config.retryPolicy
+        },
+        network: {
+          ...PRODUCTION_DEFAULTS.network,
+          ...config.network
+        },
+        metadata: {
+          ...config.metadata,
+          environment: 'mainnet'
+        }
+      };
+
+      this.validateMainnetConfig(config);
+    }
 
     // Prepare input files if any
     const uploads: { name: string; url: string }[] = [];
@@ -248,7 +325,7 @@ export class ComputeService {
       annotations: config.metadata?.annotations,
       projectId: config.metadata?.projectId,
       // Retry policy
-      retry: config.retry,
+      retry: config.retryPolicy,
       // Input file uploads
       uploads: uploads.length > 0 ? uploads : undefined,
       // Timeout
@@ -262,28 +339,28 @@ export class ComputeService {
     return {
       jobId: job.id,
       status: job.status,
-    };
+    } as { jobId: string; status: Status };
   }
 
   /**
    * Get the current status and details of a job
    */
-  async getJob(jobId: string): Promise<GetJobResponse> {
-    return await this.client.getJob(jobId);
+  public async getJob(jobId: string): Promise<GetJobResponse> {
+    return this.client.getJob(jobId);
   }
 
   /**
    * List recent compute jobs with pagination
    */
-  async listJobs(params?: { limit?: number; before?: string; after?: string }): Promise<ListJobsResponse> {
-    return await this.client.listJobs(params ?? {});
+  public async listJobs(params?: { limit?: number; before?: string; after?: string }): Promise<ListJobsResponse> {
+    return this.client.listJobs(params ?? {});
   }
 
   /**
    * Stream job logs, calling the callback for each new line.
    * Returns a function to stop streaming.
    */
-  async streamLogs(jobId: string, onLog: (line: string) => void): Promise<() => void> {
+  public async streamLogs(jobId: string, onLog: (line: string) => void): Promise<() => void> {
     let stopped = false;
     let offset = 0;
 
@@ -307,7 +384,7 @@ export class ComputeService {
   /**
    * Wait for a job to complete, with optional timeout
    */
-  async waitForCompletion(jobId: string, timeoutMs = 5 * 60_000): Promise<GetJobResponse> {
+  public async waitForCompletion(jobId: string, timeoutMs = 5 * 60_000): Promise<GetJobResponse> {
     const start = Date.now();
     while (true) {
       const job = await this.getJob(jobId);
@@ -323,10 +400,10 @@ export class ComputeService {
   /**
    * Download job artifact by URL
    */
-  async downloadArtifact(url: string): Promise<ArrayBuffer> {
+  public async downloadArtifact(url: string): Promise<ArrayBuffer> {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Failed to download artifact: ${res.status}`);
-    return await res.arrayBuffer();
+    return res.arrayBuffer();
   }
 
   /**
