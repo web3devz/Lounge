@@ -3,6 +3,84 @@ import { ethers } from 'ethers';
 import { nanoid } from 'nanoid';
 
 /**
+ * Resource configuration for compute jobs
+ */
+export interface ComputeResources {
+  // CPU cores (e.g., "0.5", "1", "2")
+  cpu?: string;
+  // Memory (e.g., "512Mi", "1Gi", "2Gi")
+  memory?: string;
+  // GPU requirements (e.g., "nvidia-tesla-t4")
+  gpu?: {
+    type?: string;
+    count?: number;
+  };
+  // Disk space (e.g., "10Gi")
+  storage?: string;
+  // Spot/preemptible instance
+  preemptible?: boolean;
+}
+
+/**
+ * Network configuration for compute jobs
+ */
+export interface NetworkConfig {
+  // Enable outbound internet access
+  internet?: boolean;
+  // Required ports to expose
+  ports?: Array<{
+    port: number;
+    protocol?: 'tcp' | 'udp';
+    // Make port publicly accessible
+    public?: boolean;
+  }>;
+  // DNS configuration
+  dns?: {
+    nameservers?: string[];
+    searches?: string[];
+  };
+}
+
+/**
+ * Container configuration
+ */
+export interface ContainerConfig {
+  // Working directory in container
+  workingDir?: string;
+  // User to run as (UID:GID)
+  user?: string;
+  // Additional volume mounts
+  volumes?: Array<{
+    name: string;
+    mountPath: string;
+    // Size if new volume
+    size?: string;
+    // Optional: persist volume across jobs
+    persistent?: boolean;
+  }>;
+  // Container lifecycle hooks
+  lifecycle?: {
+    preStart?: string[];
+    postStart?: string[];
+    preStop?: string[];
+  };
+}
+
+/**
+ * Metadata and labels
+ */
+export interface JobMetadata {
+  // Key-value labels
+  labels?: Record<string, string>;
+  // Annotations (non-identifying metadata)
+  annotations?: Record<string, string>;
+  // Project/group ID
+  projectId?: string;
+  // Cost tracking tags
+  costCenter?: string;
+}
+
+/**
  * Configuration for compute jobs. This extends the base job spec
  * with workflow-specific fields.
  */
@@ -15,18 +93,43 @@ export interface ComputeJobConfig extends JobSpec {
   command: string[];
   // Environment variables
   env?: Record<string, string>;
+  // Secret environment variables
+  secrets?: Record<string, string>;
   // Input files to upload
   inputs?: Array<{
     name: string;
     content: string | ArrayBuffer | Uint8Array;
+    // Optional: mark file as executable
+    executable?: boolean;
+    // Optional: mount path in container
+    mountPath?: string;
   }>;
-  // Resource limits
-  resources?: {
-    cpu?: string;    // e.g., "1" or "0.5"
-    memory?: string; // e.g., "1Gi" or "512Mi"
-  };
-  // Optional timeout in seconds
+  // Resource requirements
+  resources?: ComputeResources;
+  // Network configuration
+  network?: NetworkConfig;
+  // Container configuration
+  container?: ContainerConfig;
+  // Job metadata and labels
+  metadata?: JobMetadata;
+  // Maximum runtime in seconds
   timeoutSeconds?: number;
+  // Retry policy
+  retry?: {
+    limit: number;
+    // Minimum wait between retries
+    minBackoff?: string;
+    // Maximum wait between retries
+    maxBackoff?: string;
+  };
+  // Dependencies on other jobs
+  dependencies?: Array<{
+    jobId: string;
+    // Optional: wait for specific status
+    status?: Status;
+    // Optional: timeout waiting for dep
+    timeoutSeconds?: number;
+  }>;
 }
 
 /**
@@ -36,6 +139,7 @@ export interface ComputeJobConfig extends JobSpec {
  */
 export class ComputeService {
   private client: ComputeClient;
+  private activeJobs: Map<string, { stopLogs?: () => void }> = new Map();
 
   constructor(config?: {
     apiKey?: string;
@@ -57,40 +161,104 @@ export class ComputeService {
    * Returns the job ID and initial status.
    */
   async submitJob(config: ComputeJobConfig): Promise<{ jobId: string; status: Status }> {
-    // Generate a unique job ID if not provided
-    const jobId = config.id ?? nanoid();
+    // Generate a unique job ID
+    const jobId = nanoid();
 
-    // If there are input files, get presigned URLs and upload them
+    // Prepare input files if any
+    const uploads: { name: string; url: string }[] = [];
     if (config.inputs?.length) {
       const uploadSpecs = config.inputs.map(input => ({ name: input.name }));
       const presignedUrls = await this.client.getUploadUrls(uploadSpecs);
 
-      // Upload all files in parallel
-      await Promise.all(presignedUrls.uploads.map(async (upload) => {
-        const content = config.inputs!.find(i => i.name === upload.name)?.content;
-        if (!content) throw new Error(`Missing content for input file: ${upload.name}`);
-        await this.uploadFile(upload.url, content);
+      // Upload files in parallel
+      await Promise.all(presignedUrls.uploads.map(async (upload: { name: string; url: string }) => {
+        const input = config.inputs!.find(i => i.name === upload.name);
+        if (!input) throw new Error(`Missing input spec for: ${upload.name}`);
+        await this.uploadFile(upload.url, input.content);
+        
+        uploads.push({
+          name: upload.name,
+          url: upload.url,
+        });
       }));
-
-      // Update job spec with upload references
-      config = {
-        ...config,
-        uploads: presignedUrls.uploads,
-      };
     }
 
-    // Submit the job
-    const job = await this.client.submitJob({
+    // Handle dependencies
+    let dependencies: string[] | undefined;
+    if (config.dependencies?.length) {
+      // Wait for all dependencies in parallel
+      await Promise.all(config.dependencies.map(async dep => {
+        const timeout = dep.timeoutSeconds ?? 300; // 5 min default
+        const start = Date.now();
+
+        while (true) {
+          const depJob = await this.getJob(dep.jobId);
+          if (dep.status ? depJob.status === dep.status : depJob.status === 'SUCCEEDED') {
+            break;
+          }
+          if (depJob.status === 'FAILED') {
+            throw new Error(`Dependency ${dep.jobId} failed`);
+          }
+          if (Date.now() - start > timeout * 1000) {
+            throw new Error(`Timeout waiting for dependency ${dep.jobId}`);
+          }
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }));
+      dependencies = config.dependencies.map(d => d.jobId);
+    }
+
+    // Prepare the complete job spec
+    const jobSpec: JobSpec & { uploads?: typeof uploads } = {
       id: jobId,
       name: config.name,
       image: config.image,
       command: config.command,
-      env: config.env,
-      resources: config.resources,
+      // Environment and secrets
+      env: {
+        ...config.env,
+        ...(config.secrets ? Object.fromEntries(
+          Object.entries(config.secrets).map(([k, v]) => [`SECRET_${k}`, v])
+        ) : {}),
+      },
+      // Container configuration
+      workingDir: config.container?.workingDir,
+      user: config.container?.user,
+      volumes: config.container?.volumes,
+      // Resource limits
+      resources: {
+        cpu: config.resources?.cpu,
+        memory: config.resources?.memory,
+        gpu: config.resources?.gpu && {
+          type: config.resources.gpu.type,
+          count: config.resources.gpu.count,
+        },
+        storage: config.resources?.storage,
+      },
+      // Network config if specified
+      network: config.network && {
+        internet: config.network.internet,
+        ports: config.network.ports,
+        dns: config.network.dns,
+      },
+      // Lifecycle hooks
+      lifecycle: config.container?.lifecycle,
+      // Metadata
+      labels: config.metadata?.labels,
+      annotations: config.metadata?.annotations,
+      projectId: config.metadata?.projectId,
+      // Retry policy
+      retry: config.retry,
+      // Input file uploads
+      uploads: uploads.length > 0 ? uploads : undefined,
+      // Timeout
       timeout: config.timeoutSeconds ? `${config.timeoutSeconds}s` : undefined,
-      ...config,
-    });
+      // Dependencies
+      dependencies,
+    };
 
+    // Submit the job
+    const job = await this.client.submitJob(jobSpec);
     return {
       jobId: job.id,
       status: job.status,
@@ -165,14 +333,17 @@ export class ComputeService {
    * Helper to upload a file to a presigned URL
    */
   private async uploadFile(url: string, content: string | ArrayBuffer | Uint8Array): Promise<void> {
-    const body = typeof content === 'string' ? content :
-      content instanceof ArrayBuffer ? new Uint8Array(content) :
-      content;
+    let body: string | Uint8Array;
+    if (typeof content === 'string') {
+      body = content;
+    } else {
+      body = content instanceof ArrayBuffer ? new Uint8Array(content) : content;
+    }
 
     const res = await fetch(url, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/octet-stream' },
-      body,
+      body: body as BodyInit,
     });
 
     if (!res.ok) throw new Error(`Failed to upload file: ${res.status}`);
